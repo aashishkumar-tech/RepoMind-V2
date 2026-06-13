@@ -194,3 +194,10 @@ scratch/
 playground/
 NOTES.md
 TODO.md
+
+# ───── Deployment Artifacts (NEVER COMMIT) ─────
+current_env.json
+env-update.json
+env-backup*.json
+backup-env-*.json
+staged-preview.txt
