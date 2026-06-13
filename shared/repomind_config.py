@@ -26,13 +26,25 @@ CONFIG SCHEMA (.repomind.yml):
       max_risk_level: low   # low | medium | high
       min_confidence: 0.7
     notifications:
-      slack_webhook: ""     # optional
-      email: ""             # optional
+      enabled: true                      # master toggle (default true)
+      slack_webhook: ""                  # optional
+      email: ""                          # legacy single recipient (back-compat)
+      emails:                            # preferred list of recipients
+        - dev@team.com
+        - lead@team.com
+      events:                            # per-event toggles (all default true)
+        ci_failed: true
+        pr_review_needed: true
+        pr_merged: true
+        pr_rejected: false
+        rollback: true
+        pipeline_error: true
 
 DEFAULTS (when .repomind.yml is missing or invalid):
     mode: dry_run           # SAFE default — never opens PRs without consent
     hitl_required: true     # ALWAYS ask humans before merge
     policy: (operator defaults)
+    notifications.emails: [] → falls back to NOTIFICATION_EMAILS env var
 
 COMMUNICATION:
 ─────────────
@@ -41,6 +53,7 @@ COMMUNICATION:
 - Policy engine (policy_engine) reads it to merge with operator rules.
 - PR creator (pr_creator) reads `mode` to decide PR vs comment vs skip.
 - HITL nodes (agents) read `hitl_required` to decide interrupt vs auto-merge.
+- Notifier (shared.notifier) reads .to_notifier_config() for routing.
 """
 
 from typing import Dict, Any, Optional, List
@@ -69,8 +82,11 @@ SAFE_DEFAULT_CONFIG: Dict[str, Any] = {
         "min_confidence": 0.7,
     },
     "notifications": {
+        "enabled": True,
         "slack_webhook": "",
         "email": "",
+        "emails": [],
+        "events": {},
     },
     # Internal: was this loaded from the repo or are we using defaults?
     "_source": "default",
@@ -92,8 +108,13 @@ class RepoMindConfig:
     allowed_failure_types: List[str] = field(default_factory=list)
     max_risk_level: str = "low"
     min_confidence: float = 0.7
+    # ── Notifications ──
+    notification_enabled: bool = True
     slack_webhook: str = ""
-    email: str = ""
+    email: str = ""                                          # legacy single recipient
+    notification_emails: List[str] = field(default_factory=list)  # preferred list
+    notification_events: Dict[str, bool] = field(default_factory=dict)
+    # ── Meta ──
     source: str = "default"  # "repo" | "default" | "fallback"
     raw: Dict[str, Any] = field(default_factory=dict)
 
@@ -109,6 +130,20 @@ class RepoMindConfig:
     def is_auto_fix(self) -> bool:
         return self.mode == "auto_fix"
 
+    @property
+    def effective_emails(self) -> List[str]:
+        """
+        Resolve final recipient list:
+            1. notifications.emails (list)  → if present, use it
+            2. notifications.email (string) → wrapped in [..]
+            3. []                           → notifier falls back to env var
+        """
+        if self.notification_emails:
+            return self.notification_emails
+        if self.email:
+            return [self.email]
+        return []
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "mode": self.mode,
@@ -119,10 +154,28 @@ class RepoMindConfig:
                 "min_confidence": self.min_confidence,
             },
             "notifications": {
+                "enabled": self.notification_enabled,
                 "slack_webhook": self.slack_webhook,
                 "email": self.email,
+                "emails": self.notification_emails,
+                "events": self.notification_events,
             },
             "_source": self.source,
+        }
+
+    def to_notifier_config(self) -> Dict[str, Any]:
+        """
+        Adapter for `shared.notifier.Notifier.send_event(..., repo_config=...)`.
+
+        Returns the exact dict shape the notifier's `_resolve_recipients`
+        and `_event_enabled` methods expect.
+        """
+        return {
+            "notifications": {
+                "enabled": self.notification_enabled,
+                "emails": self.effective_emails,
+                "events": self.notification_events,
+            }
         }
 
 
@@ -169,13 +222,30 @@ def parse_config(raw: Dict[str, Any], source: str = "repo") -> RepoMindConfig:
         min_confidence = 0.7
     min_confidence = max(0.0, min(1.0, min_confidence))
 
-    # Notifications
+    # ── Notifications block ──
     notifications = raw.get("notifications") or {}
     if not isinstance(notifications, dict):
         notifications = {}
 
+    notification_enabled = bool(notifications.get("enabled", True))
     slack_webhook = str(notifications.get("slack_webhook", "")).strip()
-    email = str(notifications.get("email", "")).strip()
+    email = str(notifications.get("email", "")).strip()  # legacy single
+
+    # Preferred plural list
+    emails_raw = notifications.get("emails") or []
+    if not isinstance(emails_raw, list):
+        emails_raw = []
+    notification_emails = [
+        str(e).strip() for e in emails_raw if str(e).strip()
+    ]
+
+    # Per-event toggles (e.g. {"rollback": True, "pr_merged": False})
+    events_raw = notifications.get("events") or {}
+    if not isinstance(events_raw, dict):
+        events_raw = {}
+    notification_events = {
+        str(k).strip(): bool(v) for k, v in events_raw.items() if str(k).strip()
+    }
 
     return RepoMindConfig(
         mode=mode,
@@ -183,8 +253,11 @@ def parse_config(raw: Dict[str, Any], source: str = "repo") -> RepoMindConfig:
         allowed_failure_types=allowed_types,
         max_risk_level=max_risk,
         min_confidence=min_confidence,
+        notification_enabled=notification_enabled,
         slack_webhook=slack_webhook,
         email=email,
+        notification_emails=notification_emails,
+        notification_events=notification_events,
         source=source,
         raw=raw,
     )
@@ -201,11 +274,19 @@ def parse_yaml_text(yaml_text: str) -> RepoMindConfig:
 
 
 # ──────────────────────────────────────────────
-# Loading from GitHub
+# Loading from GitHub (with warm-start cache)
 # ──────────────────────────────────────────────
+import time
+
+_CONFIG_CACHE: Dict[str, tuple] = {}     # {"owner/repo": (cfg, fetched_at)}
+_CONFIG_CACHE_TTL = 300                  # 5 min — survives warm starts
+
+
 def load_repomind_config(
     repo: str,
     ref: Optional[str] = None,
+    *,
+    use_cache: bool = True,
 ) -> RepoMindConfig:
     """
     Load `.repomind.yml` from the user's repo via GitHub Contents API.
@@ -215,13 +296,23 @@ def load_repomind_config(
     but never takes destructive action without explicit consent.
 
     Args:
-        repo: Full repo name "owner/repo".
-        ref:  Optional branch/SHA to read from. Defaults to the repo's
-              default branch.
+        repo:      Full repo name "owner/repo".
+        ref:       Optional branch/SHA to read from. Defaults to the repo's
+                   default branch.
+        use_cache: Skip the warm-start cache (used by webhook on push events).
 
     Returns:
         RepoMindConfig — never None, always safe to use.
     """
+    # ── Cache lookup ──
+    cache_key = f"{repo}@{ref or 'default'}"
+    if use_cache:
+        cached = _CONFIG_CACHE.get(cache_key)
+        if cached:
+            cfg, fetched_at = cached
+            if time.time() - fetched_at < _CONFIG_CACHE_TTL:
+                return cfg
+
     try:
         from shared.github_auth import get_github_client
         gh = get_github_client()
@@ -240,12 +331,16 @@ def load_repomind_config(
                 repo=repo,
                 msg="No .repomind.yml; using safe defaults (dry_run + hitl)",
             )
-            return RepoMindConfig(source="default")
+            cfg = RepoMindConfig(source="default")
+            _CONFIG_CACHE[cache_key] = (cfg, time.time())
+            return cfg
 
         # GitHub Contents API may return a list when the path is a directory.
         if isinstance(content_obj, list):
             logger.warning("repomind_config_path_is_directory", repo=repo)
-            return RepoMindConfig(source="fallback")
+            cfg = RepoMindConfig(source="fallback")
+            _CONFIG_CACHE[cache_key] = (cfg, time.time())
+            return cfg
 
         try:
             yaml_text = content_obj.decoded_content.decode("utf-8")
@@ -253,7 +348,9 @@ def load_repomind_config(
             logger.warning(
                 "repomind_config_decode_failed", repo=repo, error=str(e)
             )
-            return RepoMindConfig(source="fallback")
+            cfg = RepoMindConfig(source="fallback")
+            _CONFIG_CACHE[cache_key] = (cfg, time.time())
+            return cfg
 
         cfg = parse_yaml_text(yaml_text)
         logger.info(
@@ -262,7 +359,9 @@ def load_repomind_config(
             mode=cfg.mode,
             hitl_required=cfg.hitl_required,
             allowed_types=cfg.allowed_failure_types,
+            notification_recipients=len(cfg.effective_emails),
         )
+        _CONFIG_CACHE[cache_key] = (cfg, time.time())
         return cfg
 
     except Exception as e:
@@ -275,6 +374,16 @@ def load_repomind_config(
             msg="Falling back to safe defaults",
         )
         return RepoMindConfig(source="fallback")
+
+
+def invalidate_config_cache(repo: Optional[str] = None) -> None:
+    """Clear cache for a repo (or all repos). Call on config push events."""
+    if repo:
+        keys_to_remove = [k for k in _CONFIG_CACHE if k.startswith(f"{repo}@")]
+        for k in keys_to_remove:
+            _CONFIG_CACHE.pop(k, None)
+    else:
+        _CONFIG_CACHE.clear()
 
 
 # ──────────────────────────────────────────────
@@ -311,9 +420,22 @@ policy:
   min_confidence: 0.7     # Reject fixes the agent isn't confident about
 
 # ─── Notifications (optional) ───────────────────────────────────────────
+# RepoMind will email these addresses on PR creation, merge, rejection,
+# rollback, and pipeline errors. If `emails` is empty, the operator's
+# default admin inbox receives notifications instead.
 notifications:
-  slack_webhook: ""       # e.g. "https://hooks.slack.com/services/..."
-  email: ""               # e.g. "team@example.com"
+  enabled: true
+  emails:
+    - dev@example.com
+    - lead@example.com
+  events:
+    ci_failed: true
+    pr_review_needed: true     # most useful — alerts you to review
+    pr_merged: true
+    pr_rejected: true
+    rollback: true
+    pipeline_error: true
+  slack_webhook: ""              # optional, e.g. "https://hooks.slack.com/..."
 """
 
 

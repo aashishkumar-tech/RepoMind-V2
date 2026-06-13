@@ -16,26 +16,36 @@ FLOW:
     7. Post a comment on the original fix PR
     8. Store rollback record in S3
     9. Push rollback metrics
+   10. Send notification email (multi-tenant via .repomind.yml)
 
 SAFETY GUARDS:
     ┌──────────────────┬──────────────────────────────────────────┐
     │ Guard            │ How                                      │
     ├──────────────────┼──────────────────────────────────────────┤
-    │ Anti-flapping    │ S3 key rollback.json — if exists, skip  │
-    │ Rate limit       │ Max 3 rollbacks per repo per hour       │
-    │ Kill switch      │ Checked by Verifier before calling us   │
+    │ Anti-flapping    │ S3 key rollback.json — if exists, skip   │
+    │ Rate limit       │ Max 3 rollbacks per repo per hour        │
+    │ Kill switch      │ Checked by Verifier before calling us    │
     │ Branch filter    │ Only rollback fix/* branches             │
-    │ Revert PR        │ Creates PR, not direct push (review)    │
-    │ Audit trail      │ Everything logged + stored in S3        │
+    │ Revert PR        │ Creates PR, not direct push (review)     │
+    │ Audit trail      │ Everything logged + stored in S3         │
     └──────────────────┴──────────────────────────────────────────┘
 
 COMMUNICATION:
 ─────────────
-Verifier → RollbackClient.rollback(repo, fix_branch, event_id, reason)
+Verifier      → RollbackClient.rollback(repo, fix_branch, event_id, reason)
 RollbackClient → GitHub API (PyGithub) → create revert PR
 RollbackClient → storage.put_json(rollback record)
-RollbackClient → notifier.send_email(rollback notification)
+RollbackClient → shared.repomind_config.load_repomind_config(repo)
+                 → resolves per-repo notification recipients (self-serve)
+RollbackClient → Notifier().send_event(NotificationEvent.ROLLBACK, ctx, repo_config)
 RollbackClient → metrics.rollbacks_total.inc()
+
+NOTIFICATION ROUTING:
+─────────────────────
+Per-repo `.repomind.yml` → notifications.emails: [...]   (preferred)
+Per-repo `.repomind.yml` → notifications.email: "..."    (legacy single)
+Global env var          → NOTIFICATION_EMAILS=...        (admin fallback)
+Master kill-switch      → NOTIFICATIONS_ENABLED=false    (silence all)
 """
 
 import time
@@ -396,24 +406,77 @@ class RollbackClient:
         fix_branch: str,
         result: RollbackResult,
     ) -> None:
-        """Send rollback notification email."""
+        """
+        Send rollback notification email — multi-tenant aware.
+
+        Recipient resolution (handled by notifier):
+            1. Per-repo `.repomind.yml` → notifications.emails: [...]
+            2. Per-repo `.repomind.yml` → notifications.email: "..."  (legacy)
+            3. Global env var NOTIFICATION_EMAILS                     (admin)
+
+        Per-event toggle:
+            User can set notifications.events.rollback: false to silence
+            rollback emails for their repo while keeping other events on.
+
+        Format:
+            Multipart email — HTML (branded) + plain-text fallback.
+            Falls back to legacy `send()` shim if `send_event()` returns False
+            (e.g. when no `"rollback"` template is registered).
+        """
         try:
-            from shared.notifier import Notifier
+            from shared.notifier import Notifier, NotificationEvent
+            from shared.repomind_config import load_repomind_config
+
+            # Pull per-repo config (cached for warm starts).
+            # Safe defaults are returned if .repomind.yml is missing.
+            repo_cfg = load_repomind_config(repo).to_notifier_config()
+
             notifier = Notifier()
-            notifier.send_email(
-                subject=f"🔄 RepoMind: Rollback triggered for {repo}",
-                body=(
-                    f"RepoMind V2 — Rollback\n\n"
-                    f"Repository: {repo}\n"
-                    f"Fix Branch: {fix_branch}\n"
-                    f"Status: {result.status}\n"
-                    f"Reason: {result.reason}\n"
-                    f"Revert PR: {result.revert_pr_url or 'N/A'}\n\n"
-                    f"Manual investigation may be required."
-                ),
+            context = {
+                "repo": repo,
+                "fix_branch": fix_branch,
+                "status": result.status,
+                "reason": result.reason,
+                "revert_pr_url": result.revert_pr_url or "N/A",
+                "original_pr_number": getattr(result, "original_pr_number", None),
+                "message": result.message,
+            }
+
+            sent = notifier.send_event(
+                NotificationEvent.ROLLBACK,
+                context=context,
+                repo_config=repo_cfg,
             )
+
+            # Fallback to legacy plain-text shim if templated send returned
+            # False (e.g. the "rollback" template isn't registered yet, OR
+            # the user opted out via .repomind.yml).
+            if not sent:
+                logger.info(
+                    "rollback_notification_fallback",
+                    repo=repo,
+                    msg="send_event returned False — trying legacy send()",
+                )
+                notifier.send(
+                    subject=f"🔄 RepoMind: Rollback triggered for {repo}",
+                    body=(
+                        f"RepoMind V2 — Rollback\n\n"
+                        f"Repository:   {repo}\n"
+                        f"Fix Branch:   {fix_branch}\n"
+                        f"Status:       {result.status}\n"
+                        f"Reason:       {result.reason}\n"
+                        f"Revert PR:    {result.revert_pr_url or 'N/A'}\n"
+                        f"Original PR:  #{getattr(result, 'original_pr_number', 'N/A')}\n\n"
+                        f"Manual investigation may be required."
+                    ),
+                )
         except Exception as e:
-            logger.warning("rollback_notification_failed", error=str(e))
+            logger.warning(
+                "rollback_notification_failed",
+                repo=repo,
+                error=str(e),
+                error_type=type(e).__name__,
+            )
 
     def _build_revert_pr_body(
         self,

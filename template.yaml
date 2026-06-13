@@ -4,6 +4,7 @@ Description: >
   RepoMind V2 — Self-Serve CI Auto-Fix Agent with HITL
   Serverless pipeline: Webhook → SQS → Worker (LangGraph + S3 checkpointer)
   🔐 Sensitive values loaded from AWS Secrets Manager via shared/secrets.py
+  📧 SMTP notifications via Gmail (App Password in Secrets Manager)
 
 # ─────────────────────────────────────────────────
 # Global settings for all Lambda functions
@@ -27,6 +28,18 @@ Globals:
         GITHUB_WEBHOOK_SECRET_ARN: !Ref GitHubWebhookSecretArn
         GROQ_API_KEY_SECRET_ARN: !Ref GroqApiKeyArn
         OPENAI_API_KEY_SECRET_ARN: !Ref OpenAIApiKeyArn
+        # ─────────────────────────────────────────────
+        # 📧 SMTP (Gmail) — used by shared/notifier.py
+        # SMTP_PASSWORD itself is loaded from Secrets Manager at runtime
+        # ─────────────────────────────────────────────
+        SMTP_HOST: smtp.gmail.com
+        SMTP_PORT: "587"
+        SMTP_USE_TLS: "true"
+        SMTP_FROM_NAME: RepoMind
+        NOTIFICATIONS_ENABLED: "true"
+        SMTP_USERNAME: !Ref SmtpUsername
+        SMTP_PASSWORD_SECRET_ARN: !Ref SmtpPasswordSecretArn
+        NOTIFICATION_EMAILS: !Ref NotificationEmails
 
 # ─────────────────────────────────────────────────
 # Parameters (set at deploy time via samconfig.toml)
@@ -55,6 +68,20 @@ Parameters:
     Type: String
     Description: Prometheus Pushgateway URL (e.g. http://ec2-ip:9091)
     Default: ""
+
+  # ─────────────────────────────────────────────
+  # 📧 SMTP notification parameters
+  # ─────────────────────────────────────────────
+  SmtpUsername:
+    Type: String
+    Description: Gmail address used as SMTP sender (e.g. you@gmail.com)
+  SmtpPasswordSecretArn:
+    Type: String
+    Description: ARN of Gmail App Password in AWS Secrets Manager
+    AllowedPattern: "^arn:aws:secretsmanager:[a-z0-9-]+:\\d{12}:secret:.+"
+  NotificationEmails:
+    Type: String
+    Description: Comma-separated recipient list (e.g. you@gmail.com,team@gmail.com)
 
 # ─────────────────────────────────────────────────
 # Resources
@@ -106,9 +133,10 @@ Resources:
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt EventQueue.QueueName
-        # 🔐 Read all 3 secrets — shared/config.py eagerly loads at cold start.
-        # Granting all 3 prevents AccessDenied noise in CloudWatch logs.
-        # Blast radius is still small: each ARN is explicitly listed (not "*").
+        # 🔐 Read all 4 secrets — shared/config.py + shared/notifier.py
+        # eagerly load at cold start. Granting all up-front avoids
+        # AccessDenied noise in CloudWatch.
+        # Blast radius stays small: each ARN is explicitly listed (not "*").
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -116,6 +144,7 @@ Resources:
                 - !Ref GitHubWebhookSecretArn
                 - !Ref GroqApiKeyArn
                 - !Ref OpenAIApiKeyArn
+                - !Ref SmtpPasswordSecretArn
       Events:
         WebhookApi:
           Type: Api
@@ -156,9 +185,10 @@ Resources:
               Action:
                 - ssm:GetParameter
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/repomind/*"
-        # 🔐 Read all 3 secrets — shared/config.py eagerly loads at cold start.
-        # Granting all 3 prevents AccessDenied noise in CloudWatch logs.
-        # Blast radius is still small: each ARN is explicitly listed (not "*").
+        # 🔐 Read all 4 secrets — shared/config.py + shared/notifier.py
+        # eagerly load at cold start. Granting all up-front avoids
+        # AccessDenied noise in CloudWatch.
+        # Blast radius stays small: each ARN is explicitly listed (not "*").
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -166,6 +196,7 @@ Resources:
                 - !Ref GitHubWebhookSecretArn
                 - !Ref GroqApiKeyArn
                 - !Ref OpenAIApiKeyArn
+                - !Ref SmtpPasswordSecretArn
       Events:
         SQSEvent:
           Type: SQS
@@ -186,3 +217,6 @@ Outputs:
   DataBucketName:
     Description: S3 Data Bucket
     Value: !Ref DataBucket
+  NotificationEmails:
+    Description: Notification recipients (comma-separated)
+    Value: !Ref NotificationEmails
