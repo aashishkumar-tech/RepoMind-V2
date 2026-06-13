@@ -5,8 +5,10 @@ HOW IT WORKS:
 ─────────────
 1. Loads .env file using python-dotenv
 2. Reads each variable with os.getenv() + sensible defaults
-3. Validates required secrets exist at startup (fail-fast)
-4. Exposes a single `settings` object the entire app imports
+3. For sensitive secrets (API keys, webhook secrets), prefers AWS Secrets
+   Manager via shared/secrets.py — falls back to env vars for local dev
+4. Validates required secrets exist at startup (fail-fast)
+5. Exposes a single `settings` object the entire app imports
 
 COMMUNICATION:
 ─────────────
@@ -15,6 +17,18 @@ Then uses: `settings.GITHUB_APP_ID`, `settings.GROQ_API_KEY`, etc.
 
 This is the SINGLE SOURCE OF TRUTH for all configuration.
 No module reads os.environ directly — always go through settings.
+
+SECRETS MANAGER MIGRATION (Production):
+─────────────
+For these 3 sensitive values, the loader will:
+  - Use AWS Secrets Manager if `<NAME>_SECRET_ARN` env var is set
+  - Otherwise fall back to plain `<NAME>` env var (local dev)
+
+  • GITHUB_WEBHOOK_SECRET ← GITHUB_WEBHOOK_SECRET_ARN
+  • GROQ_API_KEY          ← GROQ_API_KEY_SECRET_ARN
+  • OPENAI_API_KEY        ← OPENAI_API_KEY_SECRET_ARN
+
+See shared/secrets.py for implementation details.
 """
 
 import os
@@ -32,6 +46,18 @@ from dotenv import load_dotenv
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _env_path = _PROJECT_ROOT / ".env"
 load_dotenv(dotenv_path=_env_path)
+
+
+# ──────────────────────────────────────────────
+# 🔐 Secrets Manager helpers (production path)
+# ──────────────────────────────────────────────
+# These fall back to plain env vars when *_SECRET_ARN is not set,
+# so local development continues to work with a .env file.
+from shared.secrets import (
+    get_github_webhook_secret,
+    get_groq_api_key,
+    get_openai_api_key,
+)
 
 
 @dataclass
@@ -53,10 +79,10 @@ class Settings:
     GITHUB_APP_ID: str = ""
     GITHUB_INSTALLATION_ID: str = ""
     GITHUB_PRIVATE_KEY_PATH: str = ""
-    GITHUB_WEBHOOK_SECRET: str = ""
+    GITHUB_WEBHOOK_SECRET: str = ""  # 🔐 loaded via Secrets Manager in prod
 
     # ── Groq LLM ──
-    GROQ_API_KEY: str = ""
+    GROQ_API_KEY: str = ""  # 🔐 loaded via Secrets Manager in prod
 
     # ── Azure OpenAI ──
     AZURE_OPENAI_ENDPOINT: str = ""
@@ -73,7 +99,7 @@ class Settings:
     AZURE_SERVICE_BUS_QUEUE: str = "repomind-events"
 
     # ── OpenAI Embeddings ──
-    OPENAI_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""  # 🔐 loaded via Secrets Manager in prod
 
     # ── Email ──
     GMAIL_ADDRESS: str = ""
@@ -108,6 +134,11 @@ class Settings:
         """
         Factory method: reads every field from os.environ.
         Splits comma-separated NOTIFICATION_EMAILS into a list.
+
+        🔐 SECRETS: Sensitive values (GITHUB_WEBHOOK_SECRET, GROQ_API_KEY,
+        OPENAI_API_KEY) are loaded via shared/secrets.py helpers, which
+        prefer AWS Secrets Manager (when *_SECRET_ARN env var is set) and
+        fall back to plain env vars otherwise.
         """
         notification_emails_raw = os.getenv("NOTIFICATION_EMAILS", "")
         notification_emails = [
@@ -122,9 +153,9 @@ class Settings:
             GITHUB_APP_ID=os.getenv("GITHUB_APP_ID", ""),
             GITHUB_INSTALLATION_ID=os.getenv("GITHUB_INSTALLATION_ID", ""),
             GITHUB_PRIVATE_KEY_PATH=os.getenv("GITHUB_PRIVATE_KEY_PATH", "private-key.pem"),
-            GITHUB_WEBHOOK_SECRET=os.getenv("GITHUB_WEBHOOK_SECRET", ""),
-            GROQ_API_KEY=os.getenv("GROQ_API_KEY", ""),
-            OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", ""),
+            GITHUB_WEBHOOK_SECRET=get_github_webhook_secret(),  # 🔐 Secrets Manager or env
+            GROQ_API_KEY=get_groq_api_key(),                    # 🔐 Secrets Manager or env
+            OPENAI_API_KEY=get_openai_api_key(),                # 🔐 Secrets Manager or env
             AZURE_OPENAI_ENDPOINT=os.getenv("AZURE_OPENAI_ENDPOINT", ""),
             AZURE_OPENAI_API_KEY=os.getenv("AZURE_OPENAI_API_KEY", ""),
             AZURE_OPENAI_API_VERSION=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),

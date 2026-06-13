@@ -3,10 +3,11 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   RepoMind V2 — Self-Serve CI Auto-Fix Agent with HITL
   Serverless pipeline: Webhook → SQS → Worker (LangGraph + S3 checkpointer)
+  🔐 Sensitive values loaded from AWS Secrets Manager via shared/secrets.py
 
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────
 # Global settings for all Lambda functions
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────
 Globals:
   Function:
     Timeout: 300
@@ -21,13 +22,15 @@ Globals:
         S3_DATA_BUCKET: !Ref DataBucket
         GITHUB_APP_ID: !Ref GitHubAppId
         GITHUB_INSTALLATION_ID: !Ref GitHubInstallationId
-        GITHUB_WEBHOOK_SECRET: !Ref GitHubWebhookSecret
-        GROQ_API_KEY: !Ref GroqApiKey
-        OPENAI_API_KEY: !Ref OpenAIApiKey
+        # 🔐 Secrets Manager ARNs (loaded at runtime by shared/secrets.py)
+        # The helper auto-detects JSON vs plain-string format and caches per warm start
+        GITHUB_WEBHOOK_SECRET_ARN: !Ref GitHubWebhookSecretArn
+        GROQ_API_KEY_SECRET_ARN: !Ref GroqApiKeyArn
+        OPENAI_API_KEY_SECRET_ARN: !Ref OpenAIApiKeyArn
 
-# ──────────────────────────────────────────────
-# Parameters (set at deploy time)
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────
+# Parameters (set at deploy time via samconfig.toml)
+# ─────────────────────────────────────────────────
 Parameters:
   GitHubAppId:
     Type: String
@@ -35,26 +38,27 @@ Parameters:
   GitHubInstallationId:
     Type: String
     Description: GitHub App Installation ID
-  GitHubWebhookSecret:
+  # 🔐 ARNs are NOT secret (just AWS resource identifiers) — no NoEcho needed
+  GitHubWebhookSecretArn:
     Type: String
-    Description: GitHub Webhook Secret
-    NoEcho: true
-  GroqApiKey:
+    Description: ARN of GitHub webhook secret in AWS Secrets Manager
+    AllowedPattern: "^arn:aws:secretsmanager:[a-z0-9-]+:\\d{12}:secret:.+"
+  GroqApiKeyArn:
     Type: String
-    Description: Groq API Key
-    NoEcho: true
-  OpenAIApiKey:
+    Description: ARN of Groq API key in AWS Secrets Manager
+    AllowedPattern: "^arn:aws:secretsmanager:[a-z0-9-]+:\\d{12}:secret:.+"
+  OpenAIApiKeyArn:
     Type: String
-    Description: OpenAI API Key (for embeddings)
-    NoEcho: true
+    Description: ARN of OpenAI API key (for embeddings) in AWS Secrets Manager
+    AllowedPattern: "^arn:aws:secretsmanager:[a-z0-9-]+:\\d{12}:secret:.+"
   PushgatewayUrl:
     Type: String
     Description: Prometheus Pushgateway URL (e.g. http://ec2-ip:9091)
     Default: ""
 
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────
 # Resources
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────
 Resources:
   # ── S3 Data Bucket ──
   DataBucket:
@@ -102,6 +106,16 @@ Resources:
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt EventQueue.QueueName
+        # 🔐 Read all 3 secrets — shared/config.py eagerly loads at cold start.
+        # Granting all 3 prevents AccessDenied noise in CloudWatch logs.
+        # Blast radius is still small: each ARN is explicitly listed (not "*").
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                - !Ref GitHubWebhookSecretArn
+                - !Ref GroqApiKeyArn
+                - !Ref OpenAIApiKeyArn
       Events:
         WebhookApi:
           Type: Api
@@ -142,6 +156,16 @@ Resources:
               Action:
                 - ssm:GetParameter
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/repomind/*"
+        # 🔐 Read all 3 secrets — shared/config.py eagerly loads at cold start.
+        # Granting all 3 prevents AccessDenied noise in CloudWatch logs.
+        # Blast radius is still small: each ARN is explicitly listed (not "*").
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource:
+                - !Ref GitHubWebhookSecretArn
+                - !Ref GroqApiKeyArn
+                - !Ref OpenAIApiKeyArn
       Events:
         SQSEvent:
           Type: SQS
@@ -149,9 +173,9 @@ Resources:
             Queue: !GetAtt EventQueue.Arn
             BatchSize: 1
 
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────
 # Outputs
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────
 Outputs:
   WebhookUrl:
     Description: URL for GitHub webhook
