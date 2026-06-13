@@ -46,6 +46,15 @@ S3 STORAGE:
     embeddings/<repo-slug>/<event-id>/excerpt_embedding.json
     embeddings/<repo-slug>/<event-id>/triage_embedding.json
     embeddings/<repo-slug>/<event-id>/plan_embedding.json
+
+QDRANT CLIENT CONNECTION (cloud-safe defaults):
+    - host           = settings.QDRANT_HOST  (e.g. "xxx.aws.cloud.qdrant.io")
+    - port           = int(settings.QDRANT_PORT)  (6333 for REST)
+    - https          = settings.QDRANT_HTTPS  (true for Qdrant Cloud)
+    - api_key        = resolved via shared.secrets.get_qdrant_api_key()
+                       which handles Secrets Manager ARN + plain-env fallback
+    - prefer_grpc    = False  (gRPC is unreliable from AWS Lambda egress)
+    - timeout        = 30s    (covers Qdrant Cloud cold-start wake)
 """
 
 import json
@@ -59,6 +68,18 @@ from shared.storage import get_storage
 from shared.logger import get_logger
 from rag.embedder import Embedder, EMBEDDING_DIM
 
+# Optional Secrets Manager loader. Wrapped so the module still imports if the
+# helper isn't available (e.g. in some unit-test contexts that stub shared/*).
+# The canonical helper already handles:
+#   - Reading QDRANT_API_KEY_SECRET_ARN env var
+#   - Fetching the secret from AWS Secrets Manager
+#   - Unwrapping plain-string OR JSON-envelope payloads
+#   - Falling back to a direct QDRANT_API_KEY env var
+try:
+    from shared.secrets import get_qdrant_api_key  # type: ignore
+except Exception:  # pragma: no cover - defensive
+    get_qdrant_api_key = None  # type: ignore[assignment]
+
 logger = get_logger("rag.indexer")
 
 # ──────────────────────────────────────────────
@@ -67,6 +88,44 @@ logger = get_logger("rag.indexer")
 COLLECTION_NAME = "repomind_events"
 
 
+# ──────────────────────────────────────────────
+# Module helpers (no class state needed)
+# ──────────────────────────────────────────────
+def _resolve_qdrant_api_key() -> Optional[str]:
+    """
+    Resolve the Qdrant API key via the canonical shared.secrets helper,
+    which already handles:
+      - Reading QDRANT_API_KEY_SECRET_ARN env var
+      - Fetching the secret from AWS Secrets Manager
+      - Unwrapping plain-string OR JSON-envelope payloads
+      - Falling back to a direct QDRANT_API_KEY env var
+    Returns None on any failure (caller treats RAG as non-essential).
+    """
+    if get_qdrant_api_key is None:
+        # Helper not importable — degrade gracefully to direct env lookup
+        direct = getattr(settings, "QDRANT_API_KEY", None)
+        return str(direct) if direct else None
+
+    try:
+        key = get_qdrant_api_key()
+        return key if key else None
+    except Exception as exc:
+        logger.warning("qdrant_secret_load_failed", error=str(exc))
+        return None
+
+
+def _parse_https(value) -> bool:
+    """Coerce an env-var style value ("true"/"false"/bool/None) to bool."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return True  # safe default for cloud deployments
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+# ──────────────────────────────────────────────
+# Indexer
+# ──────────────────────────────────────────────
 class Indexer:
     """
     Indexes pipeline artifacts into Qdrant and backs up embeddings to S3.
@@ -78,27 +137,83 @@ class Indexer:
         self._qdrant = None
 
     def _get_qdrant(self):
-        """Lazy-load Qdrant client and ensure collection exists."""
+        """
+        Lazy-load Qdrant client and ensure collection exists.
+
+        On any failure (init, auth, network, collection-create), resets
+        self._qdrant to None and re-raises so the caller can decide whether
+        to swallow (RAG is non-fatal) or surface the error.
+        """
         if self._qdrant is None:
             from qdrant_client import QdrantClient
             from qdrant_client.models import Distance, VectorParams
 
-            self._qdrant = QdrantClient(
-                host=settings.QDRANT_HOST,
-                port=settings.QDRANT_PORT,
-            )
+            api_key = _resolve_qdrant_api_key()
+            https = _parse_https(getattr(settings, "QDRANT_HTTPS", "true"))
+            host = settings.QDRANT_HOST
+            port = int(getattr(settings, "QDRANT_PORT", 6333) or 6333)
 
-            # Create collection if it doesn't exist
-            collections = [c.name for c in self._qdrant.get_collections().collections]
-            if COLLECTION_NAME not in collections:
-                self._qdrant.create_collection(
-                    collection_name=COLLECTION_NAME,
-                    vectors_config=VectorParams(
-                        size=EMBEDDING_DIM,
-                        distance=Distance.COSINE,
-                    ),
+            # ── Construct client ──
+            try:
+                self._qdrant = QdrantClient(
+                    host=host,
+                    port=port,
+                    https=https,
+                    api_key=api_key,
+                    prefer_grpc=False,   # gRPC is unreliable from Lambda egress
+                    timeout=30,
                 )
-                logger.info("qdrant_collection_created", name=COLLECTION_NAME)
+                logger.info(
+                    "qdrant_client_initialized",
+                    host=host,
+                    port=port,
+                    https=https,
+                    has_api_key=bool(api_key),
+                )
+            except Exception as exc:
+                logger.error(
+                    "qdrant_client_init_failed",
+                    host=host,
+                    port=port,
+                    https=https,
+                    has_api_key=bool(api_key),
+                    error=str(exc),
+                )
+                self._qdrant = None
+                raise
+
+            # ── Ensure collection exists ──
+            try:
+                collections = [
+                    c.name for c in self._qdrant.get_collections().collections
+                ]
+                if COLLECTION_NAME not in collections:
+                    self._qdrant.create_collection(
+                        collection_name=COLLECTION_NAME,
+                        vectors_config=VectorParams(
+                            size=EMBEDDING_DIM,
+                            distance=Distance.COSINE,
+                        ),
+                    )
+                    logger.info(
+                        "qdrant_collection_created",
+                        name=COLLECTION_NAME,
+                        dim=EMBEDDING_DIM,
+                        distance="Cosine",
+                    )
+                else:
+                    logger.info(
+                        "qdrant_collection_exists",
+                        name=COLLECTION_NAME,
+                    )
+            except Exception as exc:
+                logger.error(
+                    "qdrant_collection_ensure_failed",
+                    name=COLLECTION_NAME,
+                    error=str(exc),
+                )
+                self._qdrant = None
+                raise
 
         return self._qdrant
 
@@ -143,7 +258,11 @@ class Indexer:
                 vector=vector,
                 text=excerpt,
                 timestamp=timestamp,
-                extra_payload={"failure_type": triage.get("failure_type", "unknown") if triage else "unknown"},
+                extra_payload={
+                    "failure_type": triage.get("failure_type", "unknown")
+                    if triage
+                    else "unknown"
+                },
             )
             points.append(point)
             self._save_embedding_s3(s3_base, "excerpt_embedding", vector, excerpt)
@@ -169,7 +288,10 @@ class Indexer:
 
         # ── Plan embedding ──
         if plan and plan.get("actions"):
-            plan_text = f"Playbook: {plan.get('playbook_id', 'custom')}. Actions: {', '.join(plan.get('actions', []))}"
+            plan_text = (
+                f"Playbook: {plan.get('playbook_id', 'custom')}. "
+                f"Actions: {', '.join(plan.get('actions', []))}"
+            )
             vector = self.embedder.embed_text(plan_text)
             point = self._build_point(
                 event_id=event_id,
@@ -185,7 +307,9 @@ class Indexer:
 
         # ── Verification embedding ──
         if verification and verification.get("details"):
-            verify_text = f"Verification: {verification['status']} - {verification['details']}"
+            verify_text = (
+                f"Verification: {verification['status']} - {verification['details']}"
+            )
             vector = self.embedder.embed_text(verify_text)
             point = self._build_point(
                 event_id=event_id,
@@ -194,16 +318,19 @@ class Indexer:
                 vector=vector,
                 text=verify_text,
                 timestamp=timestamp,
-                extra_payload={"verification_status": verification.get("status", "unknown")},
+                extra_payload={
+                    "verification_status": verification.get("status", "unknown")
+                },
             )
             points.append(point)
-            self._save_embedding_s3(s3_base, "verification_embedding", vector, verify_text)
+            self._save_embedding_s3(
+                s3_base, "verification_embedding", vector, verify_text
+            )
 
         # ── Upsert to Qdrant ──
         if points:
             try:
                 client = self._get_qdrant()
-                from qdrant_client.models import PointStruct
                 client.upsert(
                     collection_name=COLLECTION_NAME,
                     points=points,
@@ -215,7 +342,9 @@ class Indexer:
                     types=[p.payload["embedding_type"] for p in points],
                 )
             except Exception as e:
-                logger.error("qdrant_upsert_failed", event_id=event_id, error=str(e))
+                logger.error(
+                    "qdrant_upsert_failed", event_id=event_id, error=str(e)
+                )
                 # Non-fatal: embeddings are backed up in S3
 
         return len(points)

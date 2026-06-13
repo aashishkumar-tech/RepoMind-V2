@@ -8,7 +8,10 @@ Creates a pull request on the target repository with the auto-fix changes.
 Flow:
     1. Authenticate via GitHub App
     2. Get the default branch (main/master)
-    3. Create a new branch: fix/<failure-type>-<event-id-suffix>
+    3. Create a UNIQUE fix branch:
+         fix/<failure-type>-<YYYYMMDD-HHMMSS>-<event-id-suffix>
+       (timestamp + event-id suffix → collision-proof across retries
+        and multi-event-per-day scenarios)
     4. Filter out files our App is not allowed to touch
        (e.g. `.github/workflows/*` needs `workflows: write` permission)
     5. Apply remaining code changes from the plan
@@ -32,6 +35,16 @@ V2 PERMISSION SAFETY:
     a `workflow_file_skipped` event so reviewers can see what was
     proposed and apply it by hand.
 
+V2 BRANCH COLLISION HARDENING (Bug #5):
+    Old naming `fix/<failure_type>-<YYYYMMDD>` collided on multiple
+    failures of the same type on the same day. New naming includes:
+      • UTC timestamp down to the second
+      • 8-char event-id suffix
+      • Auto-retry with random suffix if the (extremely unlikely) collision
+        still occurs
+    Result: every fix attempt lands on its own pristine branch.
+    No more "pushing new commits to a stale PR branch" footguns.
+
 COMMUNICATION:
 ─────────────
 Worker calls (via hitl_nodes.pr_creator_node):
@@ -41,6 +54,8 @@ Returns: { url, branch, commit_sha, title, status }
 Stored in artifacts.json → "pr" section
 """
 
+import re
+import secrets as _stdlib_secrets   # stdlib — aliased to avoid clashing with shared/secrets.py
 from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timezone
 
@@ -58,6 +73,25 @@ logger = get_logger("pr_creator.pr_creator")
 RESTRICTED_PATH_PREFIXES = (
     ".github/workflows/",
 )
+
+
+# ──────────────────────────────────────────────
+# Git ref name hygiene
+# ──────────────────────────────────────────────
+# Git refs disallow many characters (spaces, colons, ~, ^, :, ?, *, [, \, .., //).
+# We collapse anything outside [A-Za-z0-9_-] to a single dash, then de-dupe dashes.
+# This protects branch creation from weird triage outputs like
+# "failure_type": "test: ImportError!" → would otherwise raise an invalid-ref error.
+_GIT_REF_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_\-]+")
+
+
+def _sanitize_for_git_ref(value: str, fallback: str = "unknown") -> str:
+    """Make a string safe to embed in a Git ref name."""
+    if not value:
+        return fallback
+    cleaned = _GIT_REF_SANITIZE_RE.sub("-", value.strip())
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return cleaned or fallback
 
 
 class PRCreator:
@@ -141,10 +175,10 @@ class PRCreator:
             # Determine base branch
             base_branch = head_branch or repository.default_branch
 
-            # Build branch name
+            # ── Build a unique branch name (timestamp + event-id suffix) ──
+            # See _build_fix_branch_name for collision-prevention rationale.
             failure_type = triage.get("failure_type", "unknown")
-            short_id = event_id.split("-")[-1][:8] if event_id else "fix"
-            fix_branch = f"fix/{failure_type}-{short_id}"
+            fix_branch = self._build_fix_branch_name(failure_type, event_id)
 
             logger.info(
                 "creating_pr",
@@ -158,18 +192,47 @@ class PRCreator:
             base_ref = repository.get_git_ref(f"heads/{base_branch}")
             base_sha = base_ref.object.sha
 
-            # Create the fix branch
-            try:
-                repository.create_git_ref(
-                    ref=f"refs/heads/{fix_branch}",
-                    sha=base_sha,
-                )
-                logger.info("branch_created", branch=fix_branch)
-            except Exception as e:
-                if "Reference already exists" in str(e):
-                    logger.warning("branch_exists", branch=fix_branch)
-                else:
+            # ── Create the fix branch, with retry-on-collision ──
+            # Collisions are astronomically rare (would require same failure_type
+            # + same UTC second + same 8-char event-id suffix), but if Lambda
+            # warm-start clock skew or a deliberate retry races, we append a
+            # random suffix and try again rather than reusing a stale branch.
+            MAX_BRANCH_CREATE_ATTEMPTS = 5
+            branch_created = False
+            for attempt in range(1, MAX_BRANCH_CREATE_ATTEMPTS + 1):
+                try:
+                    repository.create_git_ref(
+                        ref=f"refs/heads/{fix_branch}",
+                        sha=base_sha,
+                    )
+                    logger.info(
+                        "branch_created",
+                        branch=fix_branch,
+                        attempt=attempt,
+                    )
+                    branch_created = True
+                    break
+                except Exception as e:
+                    if "Reference already exists" in str(e):
+                        # Add 4 hex chars and retry — never reuse an existing branch
+                        suffix = _stdlib_secrets.token_hex(2)
+                        old = fix_branch
+                        fix_branch = f"{fix_branch}-{suffix}"
+                        logger.warning(
+                            "branch_collision_retrying",
+                            old_branch=old,
+                            new_branch=fix_branch,
+                            attempt=attempt,
+                        )
+                        continue
+                    # Any other error (auth, rate limit, etc.) — propagate
                     raise
+
+            if not branch_created:
+                raise RuntimeError(
+                    f"Failed to create unique fix branch after "
+                    f"{MAX_BRANCH_CREATE_ATTEMPTS} attempts (last tried: {fix_branch})"
+                )
 
             # ── V2: Filter out files we don't have permission to touch ──
             raw_changes: List[Dict[str, Any]] = plan.get("code_changes", []) or []
@@ -289,6 +352,40 @@ class PRCreator:
                 "error": str(e),
                 "mode": "auto_fix",
             }
+
+    # ──────────────────────────────────────────────
+    # Branch naming (collision-free)
+    # ──────────────────────────────────────────────
+    def _build_fix_branch_name(self, failure_type: str, event_id: str) -> str:
+        """
+        Build a unique branch name for this fix attempt.
+
+        Format: fix/<failure_type>-<YYYYMMDD-HHMMSS>-<short_event_id>
+
+        Examples:
+            fix/import_error-20260613-143052-a8b3c9d1
+            fix/test_failure-20260613-143055-f4e2a1b8
+            fix/unknown-20260613-143100-7f3e8b2a       (no event_id → random)
+
+        Why this format guarantees uniqueness:
+            • failure_type   → human-readable category (sanitized for git)
+            • UTC timestamp  → two distinct CI events can't share the same
+                               second; even retries-of-retries get a fresh ref
+            • short_event_id → debugging breadcrumb (matches CloudWatch logs)
+
+        Replaces the old `fix/<failure_type>-<YYYYMMDD>` scheme which
+        collided whenever the same failure_type happened twice on the
+        same day (Bug #5).
+        """
+        safe_type = _sanitize_for_git_ref(failure_type, fallback="unknown")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        short_id = (
+            event_id.split("-")[-1][:8]
+            if event_id
+            else _stdlib_secrets.token_hex(4)
+        )
+        short_id = _sanitize_for_git_ref(short_id, fallback="fix")
+        return f"fix/{safe_type}-{timestamp}-{short_id}"
 
     # ──────────────────────────────────────────────
     # Permission gating

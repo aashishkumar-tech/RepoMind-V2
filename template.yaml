@@ -5,6 +5,7 @@ Description: >
   Serverless pipeline: Webhook → SQS → Worker (LangGraph + S3 checkpointer)
   🔐 Sensitive values loaded from AWS Secrets Manager via shared/secrets.py
   📧 SMTP notifications via Gmail (App Password in Secrets Manager)
+  🧠 RAG via Qdrant Cloud (API key secret created+managed by this stack)
 
 # ─────────────────────────────────────────────────
 # Global settings for all Lambda functions
@@ -83,6 +84,33 @@ Parameters:
     Type: String
     Description: Comma-separated recipient list (e.g. you@gmail.com,team@gmail.com)
 
+  # ─────────────────────────────────────────────
+  # 🧠 Qdrant (Vector DB for RAG) — Cloud-hosted
+  #     The API key is stored in a Secret created by THIS stack
+  #     (see QdrantApiKeySecret resource below). No separate
+  #     `aws secretsmanager create-secret` call is required.
+  # ─────────────────────────────────────────────
+  QdrantHost:
+    Type: String
+    Description: Qdrant Cloud cluster URL (without https:// prefix)
+  QdrantPort:
+    Type: String
+    Default: "6333"
+    Description: Qdrant REST port (6333 standard, 6334 for gRPC)
+  QdrantHttps:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Use TLS when connecting to Qdrant (true for Cloud)
+  QdrantApiKeyValue:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: >
+      Qdrant Cloud API key (JWT). CloudFormation will store this value
+      in AWS Secrets Manager as `repomind/qdrant-api-key`. NoEcho hides
+      it from console/CloudFormation logs.
+
 # ─────────────────────────────────────────────────
 # Resources
 # ─────────────────────────────────────────────────
@@ -117,6 +145,33 @@ Resources:
       QueueName: repomind-events-dlq
       MessageRetentionPeriod: 1209600
 
+  # ─────────────────────────────────────────────
+  # 🧠 Qdrant API Key Secret (managed by this stack)
+  # ─────────────────────────────────────────────
+  # For `AWS::SecretsManager::Secret`, !Ref returns the full ARN — that's
+  # what we pass to the Lambdas via QDRANT_API_KEY_SECRET_ARN and what we
+  # grant Read on in the IAM policies below.
+  #
+  # ⚠️  CloudFormation will FAIL to create this resource if a secret
+  #     named "repomind/qdrant-api-key" already exists in this account
+  #     + region. If you previously created one manually, either:
+  #       (a) delete it first:  aws secretsmanager delete-secret ...
+  #       (b) OR remove the `Name:` line below to let CloudFormation
+  #           auto-generate a unique name.
+  QdrantApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: repomind/qdrant-api-key
+      Description: Qdrant Cloud API key for RepoMind RAG (managed by SAM stack)
+      SecretString: !Ref QdrantApiKeyValue
+      Tags:
+        - Key: Project
+          Value: RepoMind
+        - Key: Component
+          Value: RAG
+        - Key: ManagedBy
+          Value: CloudFormation
+
   # ── Webhook Handler (API Gateway + Lambda) ──
   WebhookFunction:
     Type: AWS::Serverless::Function
@@ -133,10 +188,13 @@ Resources:
       Policies:
         - SQSSendMessagePolicy:
             QueueName: !GetAtt EventQueue.QueueName
-        # 🔐 Read all 4 secrets — shared/config.py + shared/notifier.py
+        # 🔐 Read all secrets — shared/config.py + shared/notifier.py
         # eagerly load at cold start. Granting all up-front avoids
         # AccessDenied noise in CloudWatch.
         # Blast radius stays small: each ARN is explicitly listed (not "*").
+        # NOTE: QdrantApiKeySecret included even though webhook doesn't use
+        # RAG — shared/config.py loads all secrets at import time on every
+        # cold start.
         - Statement:
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -145,6 +203,7 @@ Resources:
                 - !Ref GroqApiKeyArn
                 - !Ref OpenAIApiKeyArn
                 - !Ref SmtpPasswordSecretArn
+                - !Ref QdrantApiKeySecret
       Events:
         WebhookApi:
           Type: Api
@@ -175,6 +234,16 @@ Resources:
           KILL_SWITCH_PARAM: /repomind/kill_switch
           VERIFICATION_ENABLED: "true"
           MAX_ROLLBACKS_PER_HOUR: "3"
+          # ── 🧠 Qdrant (RAG) ──
+          # The API key itself is loaded from Secrets Manager at runtime
+          # via shared/config.py → shared/secrets.py (consistent with
+          # every other secret in this template).
+          QDRANT_HOST: !Ref QdrantHost
+          QDRANT_PORT: !Ref QdrantPort
+          QDRANT_HTTPS: !Ref QdrantHttps
+          QDRANT_API_KEY_SECRET_ARN: !Ref QdrantApiKeySecret
+          QDRANT_TIMEOUT: "5"
+          QDRANT_CIRCUIT_BREAKER_TTL: "60"
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref DataBucket
@@ -185,7 +254,7 @@ Resources:
               Action:
                 - ssm:GetParameter
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/repomind/*"
-        # 🔐 Read all 4 secrets — shared/config.py + shared/notifier.py
+        # 🔐 Read all secrets — shared/config.py + shared/notifier.py
         # eagerly load at cold start. Granting all up-front avoids
         # AccessDenied noise in CloudWatch.
         # Blast radius stays small: each ARN is explicitly listed (not "*").
@@ -197,6 +266,7 @@ Resources:
                 - !Ref GroqApiKeyArn
                 - !Ref OpenAIApiKeyArn
                 - !Ref SmtpPasswordSecretArn
+                - !Ref QdrantApiKeySecret
       Events:
         SQSEvent:
           Type: SQS
@@ -220,3 +290,9 @@ Outputs:
   NotificationEmails:
     Description: Notification recipients (comma-separated)
     Value: !Ref NotificationEmails
+  QdrantHost:
+    Description: Qdrant cluster endpoint (RAG)
+    Value: !Ref QdrantHost
+  QdrantApiKeySecretArn:
+    Description: ARN of the Qdrant API key secret (CloudFormation-managed)
+    Value: !Ref QdrantApiKeySecret

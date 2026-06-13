@@ -20,13 +20,14 @@ No module reads os.environ directly — always go through settings.
 
 SECRETS MANAGER MIGRATION (Production):
 ─────────────
-For these 3 sensitive values, the loader will:
+For these 4 sensitive values, the loader will:
   - Use AWS Secrets Manager if `<NAME>_SECRET_ARN` env var is set
   - Otherwise fall back to plain `<NAME>` env var (local dev)
 
   • GITHUB_WEBHOOK_SECRET ← GITHUB_WEBHOOK_SECRET_ARN
   • GROQ_API_KEY          ← GROQ_API_KEY_SECRET_ARN
   • OPENAI_API_KEY        ← OPENAI_API_KEY_SECRET_ARN
+  • QDRANT_API_KEY        ← QDRANT_API_KEY_SECRET_ARN   ★ NEW
 
 See shared/secrets.py for implementation details.
 """
@@ -57,6 +58,7 @@ from shared.secrets import (
     get_github_webhook_secret,
     get_groq_api_key,
     get_openai_api_key,
+    get_qdrant_api_key,   # ★ NEW
 )
 
 
@@ -106,9 +108,18 @@ class Settings:
     GMAIL_APP_PASSWORD: str = ""
     NOTIFICATION_EMAILS: List[str] = field(default_factory=list)
 
-    # ── Qdrant ──
+    # ──────────────────────────────────────────
+    # 🧠 Qdrant (Vector DB for RAG)
+    # ──────────────────────────────────────────
+    # Connection params come from plain env vars (set by template.yaml).
+    # API key is loaded via Secrets Manager in production, falls back to
+    # plain env var for local dev. See shared/secrets.py.
     QDRANT_HOST: str = "localhost"
     QDRANT_PORT: int = 6333
+    QDRANT_HTTPS: bool = False                # ★ NEW — True for Qdrant Cloud
+    QDRANT_API_KEY: str = ""                  # ★ NEW — 🔐 via Secrets Manager
+    QDRANT_TIMEOUT: int = 5                   # ★ NEW — request timeout (seconds)
+    QDRANT_CIRCUIT_BREAKER_TTL: int = 60      # ★ NEW — back-off TTL (seconds)
 
     # ── Target Repo ──
     TARGET_REPO: str = ""
@@ -136,9 +147,9 @@ class Settings:
         Splits comma-separated NOTIFICATION_EMAILS into a list.
 
         🔐 SECRETS: Sensitive values (GITHUB_WEBHOOK_SECRET, GROQ_API_KEY,
-        OPENAI_API_KEY) are loaded via shared/secrets.py helpers, which
-        prefer AWS Secrets Manager (when *_SECRET_ARN env var is set) and
-        fall back to plain env vars otherwise.
+        OPENAI_API_KEY, QDRANT_API_KEY) are loaded via shared/secrets.py
+        helpers, which prefer AWS Secrets Manager (when *_SECRET_ARN env
+        var is set) and fall back to plain env vars otherwise.
         """
         notification_emails_raw = os.getenv("NOTIFICATION_EMAILS", "")
         notification_emails = [
@@ -167,8 +178,13 @@ class Settings:
             GMAIL_ADDRESS=os.getenv("GMAIL_ADDRESS", ""),
             GMAIL_APP_PASSWORD=os.getenv("GMAIL_APP_PASSWORD", ""),
             NOTIFICATION_EMAILS=notification_emails,
+            # ── 🧠 Qdrant ──
             QDRANT_HOST=os.getenv("QDRANT_HOST", "localhost"),
             QDRANT_PORT=int(os.getenv("QDRANT_PORT", "6333")),
+            QDRANT_HTTPS=os.getenv("QDRANT_HTTPS", "false").lower() == "true",  # ★ NEW
+            QDRANT_API_KEY=get_qdrant_api_key(),                                # ★ NEW (🔐)
+            QDRANT_TIMEOUT=int(os.getenv("QDRANT_TIMEOUT", "5")),               # ★ NEW
+            QDRANT_CIRCUIT_BREAKER_TTL=int(os.getenv("QDRANT_CIRCUIT_BREAKER_TTL", "60")),  # ★ NEW
             TARGET_REPO=os.getenv("TARGET_REPO", ""),
             PUSHGATEWAY_URL=os.getenv("PUSHGATEWAY_URL", ""),
             METRICS_ENABLED=os.getenv("METRICS_ENABLED", "false"),

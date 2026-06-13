@@ -16,7 +16,11 @@ FLOW:
     7. Post a comment on the original fix PR
     8. Store rollback record in S3
     9. Push rollback metrics
-   10. Send notification email (multi-tenant via .repomind.yml)
+   10. (DEPRECATED) Send notification email
+       ★ Notifications are now sent by worker.main._handle_verification
+         via shared.notify_hooks.notify_rollback (V2 rich HTML template).
+         The _notify_rollback method below is preserved as a no-op so the
+         call site in rollback() doesn't need to change.
 
 SAFETY GUARDS:
     ┌──────────────────┬──────────────────────────────────────────┐
@@ -32,16 +36,18 @@ SAFETY GUARDS:
 
 COMMUNICATION:
 ─────────────
-Verifier      → RollbackClient.rollback(repo, fix_branch, event_id, reason)
+Verifier       → RollbackClient.rollback(repo, fix_branch, event_id, reason)
 RollbackClient → GitHub API (PyGithub) → create revert PR
 RollbackClient → storage.put_json(rollback record)
-RollbackClient → shared.repomind_config.load_repomind_config(repo)
-                 → resolves per-repo notification recipients (self-serve)
-RollbackClient → Notifier().send_event(NotificationEvent.ROLLBACK, ctx, repo_config)
 RollbackClient → metrics.rollbacks_total.inc()
 
-NOTIFICATION ROUTING:
-─────────────────────
+Worker (post-RollbackClient) → shared.notify_hooks.notify_rollback(state, repo_config)
+                              → resolves per-repo notification recipients via
+                                shared.repomind_config and renders the V2
+                                HTML rollback template.
+
+NOTIFICATION ROUTING (handled by worker.main, NOT here anymore):
+────────────────────────────────────────────────────────────────
 Per-repo `.repomind.yml` → notifications.emails: [...]   (preferred)
 Per-repo `.repomind.yml` → notifications.email: "..."    (legacy single)
 Global env var          → NOTIFICATION_EMAILS=...        (admin fallback)
@@ -144,7 +150,10 @@ class RollbackClient:
             # Push metrics
             self._record_metrics(repo, reason)
 
-            # Send notification
+            # ★ DEPRECATED — no-op stub kept so the call site stays stable.
+            # Notification is now sent by worker.main._handle_verification
+            # using shared.notify_hooks.notify_rollback (richer template,
+            # full per-repo config support).
             self._notify_rollback(repo, fix_branch, revert_result)
 
             return revert_result
@@ -400,6 +409,28 @@ class RollbackClient:
         except Exception:
             pass
 
+    # ──────────────────────────────────────────────────────────────────────
+    # ★ DEPRECATED — kept as a no-op for backward compatibility.
+    #
+    # Rollback notifications are now sent by:
+    #     worker.main.Worker._handle_verification
+    #         → shared.notify_hooks.notify_rollback(state, repo_config)
+    #
+    # Reasons for the move:
+    #   1. Worker has access to the full message context (event_id, run_id,
+    #      head_sha, etc.) — RollbackClient only sees what was passed in.
+    #   2. Worker can load .repomind.yml for the *branch* of the failure,
+    #      ensuring per-branch notification overrides work.
+    #   3. shared.notify_hooks is the single registered place for ALL
+    #      lifecycle emails (ci_failed, pr_review_needed, pr_merged,
+    #      rollback, pipeline_error) — keeps templates + recipient
+    #      resolution consistent.
+    #   4. Eliminates the duplicate-email bug where both this method
+    #      AND the worker were emitting a rollback notification.
+    #
+    # Safe to fully delete this method (and its single call site in
+    # rollback()) once you've verified no external code depends on it.
+    # ──────────────────────────────────────────────────────────────────────
     def _notify_rollback(
         self,
         repo: str,
@@ -407,76 +438,20 @@ class RollbackClient:
         result: RollbackResult,
     ) -> None:
         """
-        Send rollback notification email — multi-tenant aware.
+        DEPRECATED — no-op.
 
-        Recipient resolution (handled by notifier):
-            1. Per-repo `.repomind.yml` → notifications.emails: [...]
-            2. Per-repo `.repomind.yml` → notifications.email: "..."  (legacy)
-            3. Global env var NOTIFICATION_EMAILS                     (admin)
-
-        Per-event toggle:
-            User can set notifications.events.rollback: false to silence
-            rollback emails for their repo while keeping other events on.
-
-        Format:
-            Multipart email — HTML (branded) + plain-text fallback.
-            Falls back to legacy `send()` shim if `send_event()` returns False
-            (e.g. when no `"rollback"` template is registered).
+        Notifications are now emitted by worker.main._handle_verification
+        via shared.notify_hooks.notify_rollback. Kept here only so the call
+        site in rollback() stays unchanged.
         """
-        try:
-            from shared.notifier import Notifier, NotificationEvent
-            from shared.repomind_config import load_repomind_config
-
-            # Pull per-repo config (cached for warm starts).
-            # Safe defaults are returned if .repomind.yml is missing.
-            repo_cfg = load_repomind_config(repo).to_notifier_config()
-
-            notifier = Notifier()
-            context = {
-                "repo": repo,
-                "fix_branch": fix_branch,
-                "status": result.status,
-                "reason": result.reason,
-                "revert_pr_url": result.revert_pr_url or "N/A",
-                "original_pr_number": getattr(result, "original_pr_number", None),
-                "message": result.message,
-            }
-
-            sent = notifier.send_event(
-                NotificationEvent.ROLLBACK,
-                context=context,
-                repo_config=repo_cfg,
-            )
-
-            # Fallback to legacy plain-text shim if templated send returned
-            # False (e.g. the "rollback" template isn't registered yet, OR
-            # the user opted out via .repomind.yml).
-            if not sent:
-                logger.info(
-                    "rollback_notification_fallback",
-                    repo=repo,
-                    msg="send_event returned False — trying legacy send()",
-                )
-                notifier.send(
-                    subject=f"🔄 RepoMind: Rollback triggered for {repo}",
-                    body=(
-                        f"RepoMind V2 — Rollback\n\n"
-                        f"Repository:   {repo}\n"
-                        f"Fix Branch:   {fix_branch}\n"
-                        f"Status:       {result.status}\n"
-                        f"Reason:       {result.reason}\n"
-                        f"Revert PR:    {result.revert_pr_url or 'N/A'}\n"
-                        f"Original PR:  #{getattr(result, 'original_pr_number', 'N/A')}\n\n"
-                        f"Manual investigation may be required."
-                    ),
-                )
-        except Exception as e:
-            logger.warning(
-                "rollback_notification_failed",
-                repo=repo,
-                error=str(e),
-                error_type=type(e).__name__,
-            )
+        logger.debug(
+            "rollback_notify_skipped_deprecated",
+            repo=repo,
+            fix_branch=fix_branch,
+            rollback_status=getattr(result, "status", None),
+            note="Notification handled by worker.main via notify_hooks",
+        )
+        return
 
     def _build_revert_pr_body(
         self,

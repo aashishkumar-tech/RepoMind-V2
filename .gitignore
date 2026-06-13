@@ -201,3 +201,9 @@ env-update.json
 env-backup*.json
 backup-env-*.json
 staged-preview.txt
+
+# Local test/invoke artifacts (don't commit)
+health-payload.json
+health-response.json
+*-response.json
+*-payload.json

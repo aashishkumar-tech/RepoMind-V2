@@ -39,6 +39,10 @@ NOTIFICATIONS (★ NEW in V2):
     All hooks pass repo_config so .repomind.yml `notifications:` block
     overrides global env vars per-repo.
 
+    ★ BUG FIX (2026-06-13) — Rollback email no longer fires when the
+       RollbackClient skipped due to anti-flap. We check the inner
+       rollback status, not just the `rollback_triggered` boolean.
+
 ERROR HANDLING:
     - Each step is wrapped in try/except
     - Errors are recorded in the timeline
@@ -644,6 +648,15 @@ class Worker:
 
         Called when a CI run completes on a fix/* branch.
         Verifies if the fix worked and triggers rollback if not.
+
+        ★ BUG FIX (2026-06-13) — Two issues fixed here:
+            1. Anti-flap suppression: when RollbackClient skips because we
+               already opened a revert PR for this branch, the verifier
+               returns rollback_triggered=True (correctly — a rollback
+               state exists) BUT no NEW rollback work was done. We must
+               NOT send another email in that case.
+            2. Repo config: we now LOAD .repomind.yml here so per-repo
+               notification overrides apply to rollback emails too.
         """
         logger.info(
             "verification_started",
@@ -684,22 +697,71 @@ class Worker:
             # ─────────────────────────────────────────────────────────────
             # ★★★ NOTIFY #5: Rollback triggered
             # Verifier decided the fix didn't work and reverted the branch.
+            #
+            # ★ BUG FIX — Check the INNER rollback status. The RollbackClient
+            #   exposes one of: "completed", "skipped", "failed", "rate_limited".
+            #   Only "completed" (i.e., a NEW revert PR was actually opened)
+            #   should trigger an email — otherwise we spam the user with one
+            #   rollback email per re-fired CI on the same fix branch.
             # ─────────────────────────────────────────────────────────────
             if getattr(result, "rollback_triggered", False):
-                state = {
-                    "event_id":     message.get("event_id"),
-                    "repo":         message.get("repo"),
-                    "branch":       message.get("head_branch"),
-                    "head_branch":  message.get("head_branch"),
-                    "commit_sha":   message.get("head_sha"),
-                    "run_id":       message.get("workflow_run_id"),
-                    "attempts":     getattr(result, "attempts", 1),
-                    "reason":       getattr(result, "rollback_reason", None)
-                                    or "Verification CI failed — fix did not resolve the issue",
-                }
-                # repo_config is not available here without re-loading; pass None.
-                # Per-repo settings will still apply via env-var defaults.
-                notify_rollback(state, repo_config=None)
+                # Resolve the inner rollback status from any of the shapes
+                # the Verifier might expose.
+                rollback_status = (
+                    getattr(result, "rollback_status", None)
+                    or (getattr(result, "rollback_result", None) or {}).get("status")
+                    or (result.to_dict().get("rollback") or {}).get("status")
+                )
+
+                # Anti-flap / rate-limited / failed → skip email
+                if rollback_status in ("skipped", "rate_limited"):
+                    logger.info(
+                        "rollback_notify_suppressed",
+                        event_id=message.get("event_id"),
+                        repo=message.get("repo"),
+                        branch=message.get("head_branch"),
+                        rollback_status=rollback_status,
+                        reason="No new revert PR was created (anti-flap or rate-limit)",
+                    )
+                else:
+                    # Real rollback occurred — load repo_config so .repomind.yml
+                    # notification overrides apply, then send the email.
+                    repo_cfg_dict: Optional[Dict[str, Any]] = None
+                    try:
+                        from shared.repomind_config import load_repomind_config
+                        repo_cfg = load_repomind_config(
+                            message["repo"],
+                            ref=message.get("head_branch") or None,
+                        )
+                        repo_cfg_dict = repo_cfg.to_dict()
+                    except Exception as cfg_err:
+                        logger.warning(
+                            "rollback_repomind_config_load_failed",
+                            event_id=message.get("event_id"),
+                            error=str(cfg_err),
+                        )
+
+                    state = {
+                        "event_id":           message.get("event_id"),
+                        "repo":               message.get("repo"),
+                        "branch":             message.get("head_branch"),
+                        "head_branch":        message.get("head_branch"),
+                        "commit_sha":         message.get("head_sha"),
+                        "head_sha":           message.get("head_sha"),
+                        "run_id":             message.get("workflow_run_id"),
+                        "workflow_run_id":    message.get("workflow_run_id"),
+                        "attempts":           getattr(result, "attempts", 1),
+                        "reason":             (
+                            getattr(result, "rollback_reason", None)
+                            or "Verification CI failed — fix did not resolve the issue"
+                        ),
+                        "rollback_status":    rollback_status or "completed",
+                        "revert_pr_url":      getattr(result, "revert_pr_url", None),
+                        "revert_pr_number":   getattr(result, "revert_pr_number", None),
+                        "original_pr_number": getattr(result, "original_pr_number", None),
+                        "fix_branch":         message.get("head_branch"),
+                    }
+                    notify_rollback(state, repo_config=repo_cfg_dict)
 
             # Push metrics
             try:
@@ -715,6 +777,7 @@ class Worker:
                 "verification_failed",
                 event_id=message.get("event_id"),
                 error=str(e),
+                traceback=traceback.format_exc(),
             )
             # ─────────────────────────────────────────────────────────────
             # ★★★ NOTIFY #6: Verification crashed

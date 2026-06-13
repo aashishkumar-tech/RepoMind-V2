@@ -15,11 +15,17 @@ STORAGE FORMATS SUPPORTED:
   Both formats work — helper auto-detects and falls back gracefully.
 
 USAGE:
-    from shared.secrets import get_openai_api_key, get_groq_api_key, get_github_webhook_secret
+    from shared.secrets import (
+        get_openai_api_key,
+        get_groq_api_key,
+        get_github_webhook_secret,
+        get_qdrant_api_key,        # 🧠 RAG vector search
+    )
 
     openai_key = get_openai_api_key()
     groq_key   = get_groq_api_key()
     webhook    = get_github_webhook_secret()
+    qdrant_key = get_qdrant_api_key()
 """
 from __future__ import annotations
 
@@ -157,4 +163,27 @@ def get_github_webhook_secret() -> str:
         arn_env="GITHUB_WEBHOOK_SECRET_ARN",
         plain_env="GITHUB_WEBHOOK_SECRET",
         json_field="webhook_secret",
+    )
+
+
+def get_qdrant_api_key() -> str:
+    """
+    🧠 Qdrant Cloud API key (for RAG vector search).
+
+    The secret is typically stored as a plain JWT string (not JSON) when
+    created by CloudFormation via `SecretString: !Ref QdrantApiKeyValue`.
+    `_resolve` handles this transparently via its Tier 1b "value" path
+    and logs `secret_used_plain_string` (informational, not an error).
+
+    Returns "" if neither `QDRANT_API_KEY_SECRET_ARN` nor `QDRANT_API_KEY`
+    is set. The Retriever's circuit breaker then disables RAG cleanly
+    instead of crashing the pipeline.
+
+    JSON storage format (optional, also supported):
+        {"api_key": "eyJhbGc..."}
+    """
+    return _resolve(
+        arn_env="QDRANT_API_KEY_SECRET_ARN",
+        plain_env="QDRANT_API_KEY",
+        json_field="api_key",
     )
