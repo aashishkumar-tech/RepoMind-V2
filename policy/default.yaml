@@ -1,0 +1,67 @@
+# policy/default.yaml — Operator-side default policy rules
+# Evaluated AFTER the user's .repomind.yml (which can restrict further).
+# Rules are evaluated in order; first match wins.
+
+rules:
+  # ── ALLOW rules (high-confidence, low-risk fixes) ──
+  - id: allow_low_risk_dependency_fix
+    description: "Allow auto-fix for low-risk dependency errors"
+    when:
+      failure_types: [dependency_error]
+      max_risk_level: low
+      min_confidence: 0.7
+    decision: allow
+
+  - id: allow_import_fix
+    description: "Allow auto-fix for import errors"
+    when:
+      failure_types: [import_error]
+      max_risk_level: low
+      min_confidence: 0.8
+    decision: allow
+
+  - id: allow_syntax_fix
+    description: "Allow auto-fix for syntax errors"
+    when:
+      failure_types: [syntax_error]
+      max_risk_level: low
+      min_confidence: 0.9
+    decision: allow
+
+  # ── NEW: allow test failures (added for demo) ──
+  - id: allow_test_failure_fix
+    description: "Allow auto-fix for pytest/unittest failures (low/medium risk)"
+    when:
+      failure_types: [test_failure]
+      max_risk_level: medium
+      min_confidence: 0.7
+    decision: allow
+
+  - id: allow_lint_fix
+    description: "Allow auto-fix for lint errors"
+    when:
+      failure_types: [lint_error]
+      max_risk_level: low
+      min_confidence: 0.7
+    decision: allow
+
+  - id: allow_type_error_fix
+    description: "Allow auto-fix for type errors"
+    when:
+      failure_types: [type_error]
+      max_risk_level: medium
+      min_confidence: 0.75
+    decision: allow
+
+  # ── DENY rules ──
+  - id: deny_high_risk
+    description: "Deny all high-risk fixes regardless of type"
+    when:
+      min_risk_level: high
+    decision: deny
+
+  # ── Fallback ──
+  - id: default_deny
+    description: "Default: deny if no rule matches (safety fallback)"
+    when: {}
+    decision: deny
